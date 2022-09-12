@@ -26,6 +26,7 @@ import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
+
 object RuleExecutor {
   protected val queryExecutionMeter = QueryExecutionMetering()
 
@@ -270,4 +271,109 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
 
     curPlan
   }
+
+  def executeTrackMultiplePlans(plan: TreeType,
+                                multiple: Boolean = false): (TreeType, List[TreeType]) = {
+    // scalastyle:off println
+    // println("Start execute")
+    // scalastyle:on println
+
+    import scala.collection.mutable.ListBuffer
+    var mult_plans = ListBuffer[TreeType]()
+    var curPlan = plan
+    val queryExecutionMetrics = RuleExecutor.queryExecutionMeter
+    val planChangeLogger = new PlanChangeLogger[TreeType]()
+    val tracker: Option[QueryPlanningTracker] = QueryPlanningTracker.get
+    val beforeMetrics = RuleExecutor.getCurrentMetrics()
+
+    // Run the structural integrity checker against the initial input
+    if (!isPlanIntegral(plan, plan)) {
+      throw QueryExecutionErrors.structuralIntegrityOfInputPlanIsBrokenInClassError(
+        this.getClass.getName.stripSuffix("$"))
+    }
+
+    batches.foreach { batch =>
+      // scalastyle:off println
+      // println("curPlan");
+      // println(curPlan.toString)
+      // scalastyle:on println
+
+      val batchStartPlan = curPlan
+      var iteration = 1
+      var lastPlan = curPlan
+      var continue = true
+
+      // Run until fix point (or the max number of iterations as specified in the strategy.
+      while (continue) {
+        curPlan = batch.rules.foldLeft(curPlan) {
+          case (plan, rule) =>
+            val startTime = System.nanoTime()
+            val result = rule(plan)
+            val runTime = System.nanoTime() - startTime
+            val effective = !result.fastEquals(plan)
+
+            if (effective) {
+              queryExecutionMetrics.incNumEffectiveExecution(rule.ruleName)
+              queryExecutionMetrics.incTimeEffectiveExecutionBy(rule.ruleName, runTime)
+              planChangeLogger.logRule(rule.ruleName, plan, result)
+              // scalastyle:off println
+              // println(result)
+              // scalastyle:on println
+              mult_plans += result
+            }
+            queryExecutionMetrics.incExecutionTimeBy(rule.ruleName, runTime)
+            queryExecutionMetrics.incNumExecution(rule.ruleName)
+
+            // Record timing information using QueryPlanningTracker
+            tracker.foreach(_.recordRuleInvocation(rule.ruleName, runTime, effective))
+
+            // Run the structural integrity checker against the plan after each rule.
+            if (effective && !isPlanIntegral(plan, result)) {
+              throw QueryExecutionErrors.structuralIntegrityIsBrokenAfterApplyingRuleError(
+                rule.ruleName, batch.name)
+            }
+
+            result
+        }
+        iteration += 1
+        if (iteration > batch.strategy.maxIterations) {
+          // Only log if this is a rule that is supposed to run more than once.
+          if (iteration != 2) {
+            val endingMsg = if (batch.strategy.maxIterationsSetting == null) {
+              "."
+            } else {
+              s", please set '${batch.strategy.maxIterationsSetting}' to a larger value."
+            }
+            val message = s"Max iterations (${iteration - 1}) reached for batch ${batch.name}" +
+              s"$endingMsg"
+            if (Utils.isTesting || batch.strategy.errorOnExceed) {
+              throw new RuntimeException(message)
+            } else {
+              logWarning(message)
+            }
+          }
+          // Check idempotence for Once batches.
+          if (batch.strategy == Once &&
+            Utils.isTesting && !excludedOnceBatches.contains(batch.name)) {
+            checkBatchIdempotence(batch, curPlan)
+          }
+          continue = false
+        }
+
+        if (curPlan.fastEquals(lastPlan)) {
+          logTrace(
+            s"Fixed point reached for batch ${batch.name} after ${iteration - 1} iterations.")
+          continue = false
+        }
+        lastPlan = curPlan
+      }
+
+      planChangeLogger.logBatch(batch.name, batchStartPlan, curPlan)
+    }
+    planChangeLogger.logMetrics(RuleExecutor.getCurrentMetrics() - beforeMetrics)
+    val mult_plan_arr: List[TreeType] = mult_plans.toList
+    val return_array: (TreeType, List[TreeType]) = (curPlan, mult_plan_arr)
+    return_array
+  }
+
 }
